@@ -239,6 +239,19 @@ class AddStudent(StatesGroup):
 
 @dp.message(F.text == "➕ Добавить ученика")
 async def btn_add_student(message: types.Message, state: FSMContext):
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь: /register_teacher")
+            return
+
+        if check_plan_limit(teacher, "students"):
+            limits = PLAN_LIMITS[teacher.subscription_plan]
+            await message.answer(f"❌ Лимит учеников на тарифе {teacher.subscription_plan}: {limits['students']}")
+            return
+
     await message.answer("Введите ФИО ученика:", reply_markup=BACK_KB)
     await state.set_state(AddStudent.waiting_for_name)
 
@@ -258,8 +271,7 @@ async def process_student_name(message: types.Message, state: FSMContext):
         student = Student(name=name, teacher_id=teacher.id)
         db.add(student)
         db.commit()
-        # Важно получить ID для родителя
-        db.refresh(student) 
+        db.refresh(student)
 
     await message.answer(f"👨‍🎓 Ученик {name} добавлен 🎉\n🆔 ID ученика: {student.id} (передайте его родителю для привязки)", reply_markup=MAIN_KB)
     await state.clear()
@@ -270,8 +282,38 @@ class CreateGroup(StatesGroup):
     waiting_for_title = State()
 
 
+PLAN_LIMITS = {
+    "FREE": {"students": 3, "groups": 1},
+    "PRO": {"students": 20, "groups": 5},
+    "PREMIUM": {"students": 100, "groups": 50}
+}
+
+def check_plan_limit(teacher, limit_type):
+    plan = teacher.subscription_plan
+    limits = PLAN_LIMITS.get(plan, {"students": 0, "groups": 0})
+
+    if limit_type == "students":
+        return len(teacher.students) >= limits["students"]
+    elif limit_type == "groups":
+        return len(teacher.groups) >= limits["groups"]
+    return False
+
+
 @dp.message(F.text == "👥 Создать группу")
 async def btn_create_group(message: types.Message, state: FSMContext):
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь: /register_teacher")
+            return
+
+        if check_plan_limit(teacher, "groups"):
+            limits = PLAN_LIMITS[teacher.subscription_plan]
+            await message.answer(f"❌ Лимит групп на тарифе {teacher.subscription_plan}: {limits['groups']}")
+            return
+
     await message.answer("Введите название группы:", reply_markup=BACK_KB)
     await state.set_state(CreateGroup.waiting_for_title)
 
@@ -291,9 +333,111 @@ async def process_group_title(message: types.Message, state: FSMContext):
         group = Group(title=title, teacher_id=teacher.id)
         db.add(group)
         db.commit()
+        db.refresh(group)
 
-    await message.answer(f"👥 Группа '{title}' создана ✅", reply_markup=MAIN_KB)
+    await message.answer(f"👥 Группа '{title}' создана ✅\n🆔 ID: {group.id}\n\nДобавляйте учеников командой: /add_to_group <ID_группы> <ID_ученика>", reply_markup=MAIN_KB)
     await state.clear()
+
+
+@dp.message(Command("add_to_group"))
+async def add_student_to_group(message: types.Message):
+    args = message.text.split()
+    if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
+        await message.answer("Использование: /add_to_group <ID_группы> <ID_ученика>")
+        return
+
+    group_id = int(args[1])
+    student_id = int(args[2])
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь.")
+            return
+
+        group = db.query(Group).filter_by(id=group_id, teacher_id=teacher.id).first()
+        if not group:
+            await message.answer("❌ Группа не найдена или не ваша.")
+            return
+
+        student = db.query(Student).filter_by(id=student_id, teacher_id=teacher.id).first()
+        if not student:
+            await message.answer("❌ Ученик не найден или не ваш.")
+            return
+
+        existing = db.query(GroupStudent).filter_by(group_id=group_id, student_id=student_id).first()
+        if existing:
+            await message.answer("⚠️ Ученик уже в группе.")
+            return
+
+        link = GroupStudent(group_id=group_id, student_id=student_id)
+        db.add(link)
+        db.commit()
+
+    await message.answer(f"✅ {student.name} добавлен в группу {group.title}")
+
+
+@dp.message(Command("remove_from_group"))
+async def remove_student_from_group(message: types.Message):
+    args = message.text.split()
+    if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
+        await message.answer("Использование: /remove_from_group <ID_группы> <ID_ученика>")
+        return
+
+    group_id = int(args[1])
+    student_id = int(args[2])
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь.")
+            return
+
+        group = db.query(Group).filter_by(id=group_id, teacher_id=teacher.id).first()
+        if not group:
+            await message.answer("❌ Группа не найдена.")
+            return
+
+        link = db.query(GroupStudent).filter_by(group_id=group_id, student_id=student_id).first()
+        if not link:
+            await message.answer("❌ Ученик не в этой группе.")
+            return
+
+        student_name = link.student.name
+        db.delete(link)
+        db.commit()
+
+    await message.answer(f"✅ {student_name} удалён из группы {group.title}")
+
+
+@dp.message(Command("list_groups"))
+async def list_groups(message: types.Message):
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь.")
+            return
+
+        groups = teacher.groups
+        if not groups:
+            await message.answer("У вас нет групп.", reply_markup=MAIN_KB)
+            return
+
+        text = "<b>👥 Ваши группы:</b>\n\n"
+        for g in groups:
+            count = len(g.students)
+            text += f"<b>{g.title}</b> (ID: {g.id})\n"
+            text += f"   👨‍🎓 Учеников: {count}\n"
+            if g.students:
+                for gs in g.students:
+                    text += f"      • {gs.student.name}\n"
+            text += "\n"
+
+        await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KB)
 
 
 # ===== Урок =====
@@ -370,6 +514,13 @@ class CreateHomework(StatesGroup):
     waiting_for_saved_in_library = State()
 
 
+class AssignHomework(StatesGroup):
+    waiting_for_hw_id = State()
+    waiting_for_target_type = State()
+    waiting_for_target_id = State()
+    waiting_for_deadline = State()
+
+
 @dp.message(F.text == "📝 Создать ДЗ")
 @dp.message(Command("create_homework"))
 async def create_hw(message: types.Message, state: FSMContext):
@@ -433,7 +584,192 @@ async def hw_save(message: types.Message, state: FSMContext):
         db.commit()
         db.refresh(hw)
 
-    await message.answer(f"✅ Домашка создана. ID: {hw.id}", reply_markup=MAIN_KB)
+    text = f"✅ Домашка создана.\n🆔 ID: {hw.id}\n📚 В библиотеке: {'Да' if saved else 'Нет'}\n\n"
+    text += "Назначить ДЗ командой: /assign_homework <ID_ДЗ>"
+    await message.answer(text, reply_markup=MAIN_KB)
+    await state.clear()
+
+
+@dp.message(Command("library"))
+async def homework_library(message: types.Message):
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь.")
+            return
+
+        homeworks = db.query(Homework).filter_by(teacher_id=teacher.id, saved_in_library=True).all()
+        if not homeworks:
+            await message.answer("Библиотека пуста.", reply_markup=MAIN_KB)
+            return
+
+        text = "<b>📚 Библиотека ДЗ:</b>\n\n"
+        for hw in homeworks:
+            text += f"<b>{hw.title}</b> (ID: {hw.id})\n"
+            if hw.content:
+                preview = hw.content[:50] + "..." if len(hw.content) > 50 else hw.content
+                text += f"   {preview}\n"
+            text += "\n"
+
+        text += "\nНазначить: /assign_homework <ID_ДЗ>"
+        await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KB)
+
+
+@dp.message(Command("assign_homework"))
+async def assign_homework_cmd(message: types.Message, state: FSMContext):
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer("Использование: /assign_homework <ID_ДЗ>")
+        return
+
+    hw_id = int(args[1])
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь.")
+            return
+
+        hw = db.query(Homework).filter_by(id=hw_id, teacher_id=teacher.id).first()
+        if not hw:
+            await message.answer("❌ ДЗ не найдено.")
+            return
+
+    await state.update_data(hw_id=hw_id)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Ученику"), KeyboardButton(text="👥 Группе")],
+            [KeyboardButton(text="⬅️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Кому назначить?", reply_markup=kb)
+    await state.set_state(AssignHomework.waiting_for_target_type)
+
+
+@dp.message(AssignHomework.waiting_for_target_type)
+async def assign_target_type(message: types.Message, state: FSMContext):
+    target_type = message.text.strip()
+
+    if target_type == "👤 Ученику":
+        await message.answer("Введите ID ученика:", reply_markup=BACK_KB)
+        await state.update_data(target_type="student")
+    elif target_type == "👥 Группе":
+        await message.answer("Введите ID группы:", reply_markup=BACK_KB)
+        await state.update_data(target_type="group")
+    else:
+        await message.answer("Выберите из предложенного.")
+        return
+
+    await state.set_state(AssignHomework.waiting_for_target_id)
+
+
+@dp.message(AssignHomework.waiting_for_target_id)
+async def assign_target_id(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("Введите число.")
+        return
+
+    await state.update_data(target_id=int(text))
+    await message.answer("Введите дедлайн (YYYY-MM-DD HH:MM) или 'skip':", reply_markup=BACK_KB)
+    await state.set_state(AssignHomework.waiting_for_deadline)
+
+
+@dp.message(AssignHomework.waiting_for_deadline)
+async def assign_deadline(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    deadline = None
+
+    if text.lower() != "skip":
+        try:
+            deadline = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
+        except:
+            await message.answer("❌ Неверный формат. Используйте YYYY-MM-DD HH:MM")
+            return
+
+    data = await state.get_data()
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь.", reply_markup=MAIN_KB)
+            await state.clear()
+            return
+
+        hw = db.query(Homework).filter_by(id=data["hw_id"], teacher_id=teacher.id).first()
+        if not hw:
+            await message.answer("❌ ДЗ не найдено.", reply_markup=MAIN_KB)
+            await state.clear()
+            return
+
+        if deadline is None:
+            deadline = datetime.datetime.utcnow() + datetime.timedelta(days=7)
+
+        if data["target_type"] == "student":
+            student = db.query(Student).filter_by(id=data["target_id"], teacher_id=teacher.id).first()
+            if not student:
+                await message.answer("❌ Ученик не найден.", reply_markup=MAIN_KB)
+                await state.clear()
+                return
+
+            assignment = HomeworkAssignment(
+                homework_id=hw.id,
+                assigned_to_type="student",
+                assigned_to_id=student.id,
+                deadline=deadline
+            )
+            db.add(assignment)
+            db.commit()
+            db.refresh(assignment)
+
+            submission = HomeworkSubmission(
+                assignment_id=assignment.id,
+                student_id=student.id,
+                status="assigned"
+            )
+            db.add(submission)
+            db.commit()
+
+            await message.answer(f"✅ ДЗ '{hw.title}' назначено {student.name}\n📅 Дедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}", reply_markup=MAIN_KB)
+
+        elif data["target_type"] == "group":
+            group = db.query(Group).filter_by(id=data["target_id"], teacher_id=teacher.id).first()
+            if not group:
+                await message.answer("❌ Группа не найдена.", reply_markup=MAIN_KB)
+                await state.clear()
+                return
+
+            if not group.students:
+                await message.answer("❌ В группе нет учеников.", reply_markup=MAIN_KB)
+                await state.clear()
+                return
+
+            assignment = HomeworkAssignment(
+                homework_id=hw.id,
+                assigned_to_type="group",
+                assigned_to_id=group.id,
+                deadline=deadline
+            )
+            db.add(assignment)
+            db.commit()
+            db.refresh(assignment)
+
+            for gs in group.students:
+                submission = HomeworkSubmission(
+                    assignment_id=assignment.id,
+                    student_id=gs.student_id,
+                    status="assigned"
+                )
+                db.add(submission)
+
+            db.commit()
+            await message.answer(f"✅ ДЗ '{hw.title}' назначено группе {group.title} ({len(group.students)} учеников)\n📅 Дедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}", reply_markup=MAIN_KB)
+
     await state.clear()
 
 
@@ -453,6 +789,7 @@ async def my_assignments(message: types.Message):
             db.query(HomeworkAssignment)
             .join(Homework)
             .filter(Homework.teacher_id == teacher.id)
+            .order_by(HomeworkAssignment.deadline)
             .all()
         )
 
@@ -460,11 +797,87 @@ async def my_assignments(message: types.Message):
             await message.answer("Назначений нет.", reply_markup=MAIN_KB)
             return
 
-        text = ""
+        text = "<b>📚 Ваши назначения:</b>\n\n"
         for a in assigns:
-            text += f"ID:{a.id} HW:{a.homework.title} deadline:{a.deadline}\n"
+            target_info = ""
+            if a.assigned_to_type == "student":
+                student = db.query(Student).filter_by(id=a.assigned_to_id).first()
+                target_info = f"👤 {student.name}" if student else "👤 (удален)"
+            elif a.assigned_to_type == "group":
+                group = db.query(Group).filter_by(id=a.assigned_to_id).first()
+                target_info = f"👥 {group.title}" if group else "👥 (удалена)"
 
-        await message.answer(text, reply_markup=MAIN_KB)
+            is_overdue = datetime.datetime.utcnow() > a.deadline
+            deadline_icon = "⚠️" if is_overdue else "📅"
+
+            text += f"<b>{a.homework.title}</b>\n"
+            text += f"   {target_info}\n"
+            text += f"   {deadline_icon} {a.deadline.strftime('%d.%m.%Y %H:%M')}\n"
+            text += f"   ID: {a.id}\n\n"
+
+        text += "Просмотр статусов: /hw_status <ID_назначения>"
+        await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KB)
+
+
+@dp.message(Command("hw_status"))
+async def hw_status(message: types.Message):
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer("Использование: /hw_status <ID_назначения>")
+        return
+
+    assign_id = int(args[1])
+    teacher_tg = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        teacher = db.query(Teacher).filter_by(telegram_id=teacher_tg).first()
+        if not teacher:
+            await message.answer("Сначала зарегистрируйтесь.")
+            return
+
+        assignment = db.query(HomeworkAssignment).filter_by(id=assign_id).first()
+        if not assignment:
+            await message.answer("❌ Назначение не найдено.")
+            return
+
+        hw = assignment.homework
+        if hw.teacher_id != teacher.id:
+            await message.answer("❌ Это не ваше назначение.")
+            return
+
+        submissions = assignment.submissions
+        if not submissions:
+            await message.answer("❌ Нет сданных работ.", reply_markup=MAIN_KB)
+            return
+
+        text = f"<b>📊 Статус: {hw.title}</b>\n\n"
+
+        assigned = len(submissions)
+        submitted = len([s for s in submissions if s.status == "submitted"])
+        graded = len([s for s in submissions if s.status == "graded"])
+        assigned_only = assigned - submitted - graded
+
+        text += f"📈 Общая статистика:\n"
+        text += f"   📌 Назначено: {assigned}\n"
+        text += f"   ⏳ Ожидают проверки: {submitted}\n"
+        text += f"   ✅ Оценено: {graded}\n"
+        text += f"   📭 Не сдали: {assigned_only}\n\n"
+
+        text += "<b>Результаты:</b>\n"
+        for sub in submissions:
+            status_emoji = {
+                "assigned": "📭",
+                "submitted": "⏳",
+                "graded": "✅",
+                "overdue": "❌"
+            }.get(sub.status, "❓")
+
+            text += f"{status_emoji} <b>{sub.student.name}</b>"
+            if sub.status == "graded":
+                text += f" - {sub.score_value} баллов"
+            text += "\n"
+
+        await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KB)
 
 
 # ======= Загрузка файлов =======
@@ -473,10 +886,10 @@ async def submit_file(message: types.Message):
     caption = (message.caption or "").strip()
 
     if not caption or not caption.split()[0].isdigit():
-        await message.answer("Укажи AssignID в caption, пример: 5", reply_markup=MAIN_KB)
+        await message.answer("❌ Укажи ID сдачи в подписи файла, пример: /hw 5", reply_markup=STUDENT_KB if str(message.from_user.id) else MAIN_KB)
         return
 
-    assign_id = int(caption.split()[0])
+    submission_id = int(caption.split()[0])
     student_tg = str(message.from_user.id)
 
     with SessionLocal() as db:
@@ -485,41 +898,36 @@ async def submit_file(message: types.Message):
             await message.answer("Сначала зарегистрируйтесь как ученик.", reply_markup=MAIN_KB)
             return
 
-        assignment = db.query(HomeworkAssignment).filter_by(id=assign_id).first()
-        if not assignment:
-            await message.answer("Назначение не найдено.", reply_markup=MAIN_KB)
+        submission = db.query(HomeworkSubmission).filter_by(id=submission_id, student_id=student.id).first()
+        if not submission:
+            await message.answer("❌ Сдача не найдена.", reply_markup=STUDENT_KB)
             return
 
-        if assignment.deadline and datetime.datetime.utcnow() > assignment.deadline:
-            await message.answer("Дедлайн прошёл.", reply_markup=MAIN_KB)
+        assignment = submission.assignment
+        if datetime.datetime.utcnow() > assignment.deadline:
+            await message.answer("❌ Дедлайн прошёл.", reply_markup=STUDENT_KB)
             return
 
         file = await message.document.get_file()
         os.makedirs("data/submissions", exist_ok=True)
 
-        local_name = f"data/submissions/{assign_id}_{student.id}_{message.document.file_name}"
+        local_name = f"data/submissions/{submission.id}_{student.id}_{message.document.file_name}"
         await file.download(destination=local_name)
 
-        submission = HomeworkSubmission(
-            assignment_id=assign_id,
-            student_id=student.id,
-            file_path=local_name,
-            status="submitted"
-        )
-
-        db.add(submission)
+        submission.file_path = local_name
+        submission.status = "submitted"
+        submission.submitted_at = datetime.datetime.utcnow()
         db.commit()
-        db.refresh(submission)
 
         hw = db.query(Homework).filter_by(id=assignment.homework_id).first()
         teacher = db.query(Teacher).filter_by(id=hw.teacher_id).first()
 
-    await message.answer(f"Файл принят. Submission ID: {submission.id}", reply_markup=MAIN_KB)
+    await message.answer(f"✅ Файл загружен. ID сдачи: {submission.id}", reply_markup=STUDENT_KB)
 
     if teacher and teacher.telegram_id:
         await bot.send_message(
             int(teacher.telegram_id),
-            f"📬 Новая работа. HW: {hw.title}"
+            f"📬 Новая работа от {student.name}\n📝 ДЗ: {hw.title}\n💾 /grade_submission {submission.id} <оценка> <комментарий>"
         )
 
 
@@ -530,13 +938,19 @@ async def grade(message: types.Message):
 
     if len(parts) < 3:
         await message.answer(
-            "Использование:\n/grade_submission <submission_id> <score> <comment>",
+            "❌ Использование: /grade_submission <submission_id> <score> <comment>\n"
+            "Пример: /grade_submission 5 95 Отлично!",
             reply_markup=MAIN_KB
         )
         return
 
-    sub_id = int(parts[1])
-    score = int(parts[2])
+    try:
+        sub_id = int(parts[1])
+        score = int(parts[2])
+    except ValueError:
+        await message.answer("❌ ID и оценка должны быть числами.", reply_markup=MAIN_KB)
+        return
+
     comment = parts[3] if len(parts) > 3 else None
     teacher_tg = str(message.from_user.id)
 
@@ -548,14 +962,14 @@ async def grade(message: types.Message):
 
         submission = db.query(HomeworkSubmission).filter_by(id=sub_id).first()
         if not submission:
-            await message.answer("Submission не найден.", reply_markup=MAIN_KB)
+            await message.answer("❌ Сдача не найдена.", reply_markup=MAIN_KB)
             return
 
-        assignment = db.query(HomeworkAssignment).filter_by(id=submission.assignment_id).first()
-        hw = db.query(Homework).filter_by(id=assignment.homework_id).first()
+        assignment = submission.assignment
+        hw = assignment.homework
 
         if hw.teacher_id != teacher.id:
-            await message.answer("Это не ваша работа.", reply_markup=MAIN_KB)
+            await message.answer("❌ Это не ваша работа.", reply_markup=MAIN_KB)
             return
 
         submission.score_value = score
@@ -564,7 +978,16 @@ async def grade(message: types.Message):
         submission.status = "graded"
         db.commit()
 
-    await message.answer("Оценка выставлена.", reply_markup=MAIN_KB)
+        student = submission.student
+
+    await message.answer(
+        f"✅ Оценка выставлена\n"
+        f"📝 {hw.title}\n"
+        f"👤 {student.name}\n"
+        f"🔢 Оценка: {score}\n"
+        f"💬 Комментарий: {comment or 'Нет'}",
+        reply_markup=MAIN_KB
+    )
 
 # ======= Финансы учеников (НОВОЕ) =======
 class StudentFinance(StatesGroup):
@@ -732,6 +1155,82 @@ async def parent_report(message: types.Message):
 
         await message.answer(report, parse_mode="HTML", reply_markup=PARENT_KB)
 
+
+
+# ======= Кабинет Ученика (НОВОЕ) =======
+STUDENT_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📝 Мои ДЗ"), KeyboardButton(text="📅 Расписание")],
+        [KeyboardButton(text="📊 Прогресс"), KeyboardButton(text="🏠 Главное меню")]
+    ],
+    resize_keyboard=True
+)
+
+
+@dp.message(Command("student_menu"))
+async def student_menu(message: types.Message):
+    tg_id = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        student = db.query(Student).filter_by(telegram_id=tg_id).first()
+        if not student:
+            await message.answer("Вы не зарегистрированы как ученик.")
+            return
+
+    await message.answer(f"👋 Привет, {student.name}!", reply_markup=STUDENT_KB)
+
+
+@dp.message(F.text == "📝 Мои ДЗ")
+async def student_homeworks(message: types.Message):
+    tg_id = str(message.from_user.id)
+
+    with SessionLocal() as db:
+        student = db.query(Student).filter_by(telegram_id=tg_id).first()
+        if not student:
+            await message.answer("Сначала зарегистрируйтесь как ученик.")
+            return
+
+        submissions = (
+            db.query(HomeworkSubmission)
+            .filter_by(student_id=student.id)
+            .join(HomeworkAssignment)
+            .order_by(HomeworkAssignment.deadline)
+            .all()
+        )
+
+        if not submissions:
+            await message.answer("У вас нет домашних заданий.", reply_markup=STUDENT_KB)
+            return
+
+        text = "<b>📝 Ваши домашние задания:</b>\n\n"
+
+        active = [s for s in submissions if s.status in ("assigned", "submitted")]
+        graded = [s for s in submissions if s.status == "graded"]
+
+        if active:
+            text += "<b>⏳ Активные:</b>\n"
+            for sub in active:
+                assignment = sub.assignment
+                hw = assignment.homework
+                is_overdue = datetime.datetime.utcnow() > assignment.deadline
+                status_icon = "🔴" if is_overdue else "🟡"
+
+                text += f"{status_icon} <b>{hw.title}</b>\n"
+                text += f"   📅 Дедлайн: {assignment.deadline.strftime('%d.%m.%Y %H:%M')}\n"
+                text += f"   Статус: {sub.status}\n"
+                text += f"   ID сдачи: {sub.id}\n\n"
+
+        if graded:
+            text += "<b>✅ Оцененные:</b>\n"
+            for sub in graded:
+                hw = sub.assignment.homework
+                text += f"<b>{hw.title}</b> - {sub.score_value} баллов\n"
+                if sub.teacher_comment:
+                    text += f"   Комментарий: {sub.teacher_comment}\n"
+                text += "\n"
+
+        text += "\n💾 Загрузите файл с текстом '/hw <ID_сдачи>' в подписи"
+        await message.answer(text, parse_mode="HTML", reply_markup=STUDENT_KB)
 
 
 async def main():

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text, JSON
 from sqlalchemy.orm import relationship
 from .db import Base
 import datetime
@@ -138,6 +138,7 @@ class HomeworkAssignment(Base):
     homework_id = Column(Integer, ForeignKey("homeworks.id"), nullable=False)
     assigned_to_type = Column(String(10))  # student/group/multi
     assigned_to_id = Column(Integer, nullable=True)
+    assigned_to_ids = Column(JSON, nullable=True)  # для multi: список ID учеников
     deadline = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -151,14 +152,15 @@ class HomeworkSubmission(Base):
     id = Column(Integer, primary_key=True, index=True)
     assignment_id = Column(Integer, ForeignKey("homework_assignments.id"), nullable=False)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
-    submitted_at = Column(DateTime, default=datetime.datetime.utcnow)
-    status = Column(String, default="assigned") # assigned, submitted, graded
+    submitted_at = Column(DateTime, nullable=True)
+    status = Column(String, default="assigned")  # assigned, submitted, graded, overdue
     score_value = Column(Integer, nullable=True)
     score_percent = Column(Integer, nullable=True)
     teacher_comment = Column(Text, nullable=True)
-    content = Column(Text, nullable=True)      
-    file_path = Column(String, nullable=True) 
-    
+    content = Column(Text, nullable=True)
+    file_path = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
     assignment = relationship("HomeworkAssignment", back_populates="submissions")
     student = relationship("Student", back_populates="submissions")
 
